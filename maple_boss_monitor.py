@@ -1,7 +1,8 @@
 """
 冒险岛Boss监控脚本
 - 截取主屏幕
-- SIFT特征点匹配检测Boss出现（不受背景/缩放/颜色影响）
+- SIFT特征点匹配检测Boss出现
+- 正确处理RGBA模板（alpha通道做mask）
 - 弹窗提醒 + 小型监控窗口显示实时状态
 
 依赖安装:
@@ -23,9 +24,6 @@ from datetime import datetime
 
 try:
     import cv2
-    # 确认SIFT可用
-    if not hasattr(cv2, 'SIFT_create'):
-        cv2.SIFT_create = cv2.xfeatures2d.SIFT_create
 except ImportError:
     print("需要安装opencv-contrib-python: pip install opencv-contrib-python numpy Pillow")
     sys.exit(1)
@@ -46,9 +44,8 @@ except ImportError:
 
 # ============ 配置（可按需修改） ============
 BOSS_IMAGE_PATH = "boss_template.png"  # boss截图文件名
-CHECK_INTERVAL = 0.5      # 检测间隔（秒）- SIFT计算量大，建议不要太短
-MATCH_THRESHOLD = 0.6      # 匹配阈值
-MIN_MATCH_COUNT = 10       # 最少特征点匹配数
+CHECK_INTERVAL = 0.5      # 检测间隔（秒）
+MIN_MATCH_COUNT = 8        # 最少特征点匹配数
 MONITOR_ONLY_MAIN = True   # True=只监控主屏幕（双屏适用）
 PREVIEW_SCALE = 0.25       # 监控窗口预览缩放比例
 WINDOW_X = -520            # 窗口X坐标
@@ -58,7 +55,25 @@ WINDOW_Y = 980             # 窗口Y坐标
 running = True
 
 sift = cv2.SIFT_create(nfeatures=500)
-bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+bf = cv2.BFMatcher(cv2.NORM_L2)
+
+
+def load_template(path):
+    """加载模板图片，正确处理RGBA alpha通道"""
+    # 用PIL读取保留alpha
+    pil_img = Image.open(path).convert("RGBA")
+    arr = np.array(pil_img)  # RGBA
+
+    alpha = arr[:, :, 3]
+    rgb = arr[:, :, :3]
+
+    # PIL是RGB, 转BGR给OpenCV
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+    # 用alpha通道做mask（透明区域忽略）
+    mask = np.where(alpha > 128, 255, 0).astype(np.uint8)
+
+    return bgr, mask
 
 
 def get_primary_screen_bounds():
@@ -76,38 +91,29 @@ def capture_main_screen():
         screenshot = ImageGrab.grab()
 
     arr = np.array(screenshot)
-
-    # 修复通道问题: ImageGrab可能返回RGBA(4通道)或RGB(3通道)
+    # 去掉alpha通道
     if arr.ndim == 3 and arr.shape[2] == 4:
-        arr = arr[:, :, :3]  # 去掉alpha通道
-
-    # PIL返回RGB, OpenCV需要BGR, 所以转换
+        arr = arr[:, :, :3]
+    # PIL RGB -> OpenCV BGR
     arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
     return arr
 
 
-def extract_sift_features(img_bgr):
-    """提取SIFT特征，自动mask白色/浅色背景"""
+def extract_sift_features(img_bgr, mask):
+    """提取SIFT特征，使用mask排除背景"""
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    # mask: 忽略白色/近白色区域
-    mask = np.ones_like(gray, dtype=np.uint8) * 255
-    white = gray > 220
-    mask[white] = 0
     kp, des = sift.detectAndCompute(gray, mask)
     return kp, des
 
 
 def detect_boss(screen_bgr, template_kp, template_des):
-    """SIFT特征匹配检测boss"""
+    """在截屏中用SIFT匹配检测boss"""
     h, w = screen_bgr.shape[:2]
-
-    # 多尺度扫描: 在不同缩放下检测
-    found = False
-    best_score = 0
     best_match_count = 0
+    best_score = 0
+    found = False
     marked = screen_bgr.copy()
 
-    # 用几个关键缩放比例
     scales = [0.5, 0.75, 1.0]
 
     for scale in scales:
@@ -122,21 +128,13 @@ def detect_boss(screen_bgr, template_kp, template_des):
         if screen_des is None or template_des is None:
             continue
 
-        # 用FLANN加速匹配
-        try:
-            flann = cv2.FlannBasedMatcher(
-                dict(algorithm=1, trees=5),
-                dict(checks=50)
-            )
-            matches = flann.knnMatch(template_des, screen_des, k=2)
-        except:
-            matches = bf.knnMatch(template_des, screen_des, k=2)
+        matches = bf.knnMatch(template_des, screen_des, k=2)
 
         good = []
-        for match_pair in matches:
-            if len(match_pair) == 2:
-                m, n = match_pair
-                if m.distance < 0.7 * n.distance:
+        for pair in matches:
+            if len(pair) == 2:
+                m, n = pair
+                if m.distance < 0.75 * n.distance:
                     good.append(m)
 
         match_count = len(good)
@@ -148,7 +146,6 @@ def detect_boss(screen_bgr, template_kp, template_des):
 
         if match_count >= MIN_MATCH_COUNT:
             found = True
-            # 画匹配点
             display = small.copy()
             for m in good:
                 sx, sy = screen_kp[m.trainIdx].pt
@@ -214,14 +211,13 @@ class MonitorWindow:
         self.conf_label = tk.StringVar(value="0.0%")
         ttk.Label(pb_frame, textvariable=self.conf_label, font=("Consolas", 8), width=6).pack(side=tk.LEFT)
 
-        self.match_var = tk.StringVar(value="点: 0/10")
+        self.match_var = tk.StringVar(value="点: 0/8")
         ttk.Label(main_frame, textvariable=self.match_var, font=("Consolas", 9)).pack(anchor=tk.W)
 
         ttk.Label(main_frame, text=f"SIFT | 间隔{CHECK_INTERVAL}s | 阈值{MIN_MATCH_COUNT}点",
                   font=("微软雅黑", 7), foreground="gray").pack(anchor=tk.W)
 
     def update_preview(self, img_bgr, found, score, match_count):
-        # BGR -> RGB 给tkinter
         small = cv2.resize(img_bgr, (self.preview_w, self.preview_h))
         rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(rgb)
@@ -258,7 +254,6 @@ def monitor_loop(window, template_kp, template_des):
             if found and not window._alert_cooldown:
                 window.master.after(0, send_alert, "🦉 BOSS出现了！快去打！", window.detected_count)
                 ts = int(time.time())
-                # 保存检测截图(BGR->RGB)
                 save_img = cv2.cvtColor(marked, cv2.COLOR_BGR2RGB)
                 Image.fromarray(save_img).save(f"boss_detected_{ts}.png")
                 window._alert_cooldown = True
@@ -283,19 +278,20 @@ def main():
         ctypes.windll.user32.MessageBoxW(0, msg, "配置错误", 0x00000010)
         sys.exit(1)
 
-    template = cv2.imread(template_path)
-    if template is None:
-        msg = f"无法读取图片:\n{template_path}"
+    # 用PIL加载模板（保留alpha通道做mask）
+    if not os.path.exists(template_path):
+        msg = f"找不到模板: {template_path}"
         ctypes.windll.user32.MessageBoxW(0, msg, "配置错误", 0x00000010)
         sys.exit(1)
 
-    template_kp, template_des = extract_sift_features(template)
+    template_bgr, template_mask = load_template(template_path)
+    template_kp, template_des = extract_sift_features(template_bgr, template_mask)
 
     print(f"🦉 冒险岛Boss监控已启动")
-    print(f"   模板: {template_path} ({template.shape[1]}x{template.shape[0]})")
-    print(f"   SIFT特征点: {len(template_kp)}")
+    print(f"   模板: {template_path} ({template_bgr.shape[1]}x{template_bgr.shape[0]})")
+    print(f"   SIFT特征点: {len(template_kp)} (仅boss区域)")
     if len(template_kp) < MIN_MATCH_COUNT:
-        print(f"   ⚠️ 警告: 特征点太少({len(template_kp)})，请换一张更清晰的截图")
+        print(f"   ⚠️ 警告: 特征点太少({len(template_kp)})")
 
     root = tk.Tk()
     window = MonitorWindow(root, template_path)
