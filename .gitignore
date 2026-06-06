@@ -6,8 +6,8 @@ __pycache__/
 dist/
 build/
 
-# Boss截图
-boss_template.png
+# Boss截图(本地自备)
+# boss_template.png
 
 # 检测结果截图
 boss_detected_*.png
