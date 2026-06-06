@@ -1,7 +1,7 @@
 """
 冒险岛Boss监控脚本
 - 截取主屏幕
-- 用模板匹配检测Boss出现
+- 用模板匹配检测Boss出现（mask忽略白色背景）
 - 弹窗提醒 + 小型监控窗口显示实时状态
 
 依赖安装:
@@ -43,7 +43,7 @@ except ImportError:
 
 # ============ 配置（可按需修改） ============
 BOSS_IMAGE_PATH = "boss_template.png"  # boss截图文件名，和脚本同目录
-CHECK_INTERVAL = 3        # 检测间隔（秒），建议3-5秒
+CHECK_INTERVAL = 1        # 检测间隔（秒）
 MATCH_THRESHOLD = 0.7    # 匹配阈值（0-1），越高越严格不容易误报，越低越灵敏
 MONITOR_ONLY_MAIN = True  # True=只监控主屏幕（双屏适用）
 PREVIEW_SCALE = 0.25     # 监控窗口预览缩放比例（越小窗口越小）
@@ -51,11 +51,21 @@ PREVIEW_SCALE = 0.25     # 监控窗口预览缩放比例（越小窗口越小�
 
 running = True
 
+
+def create_template_mask(template_img):
+    """创建mask，把白色/近白色背景区域标记为忽略"""
+    gray = cv2.cvtColor(template_img, cv2.COLOR_BGR2GRAY)
+    # 白色像素(>230)标记为0（忽略），其他标记为255（参与匹配）
+    mask = np.where(gray > 230, 0, 255).astype(np.uint8)
+    return mask
+
+
 def get_primary_screen_bounds():
     user32 = ctypes.windll.user32
     w = user32.GetSystemMetrics(0)
     h = user32.GetSystemMetrics(1)
     return (0, 0, w, h)
+
 
 def capture_main_screen():
     if MONITOR_ONLY_MAIN:
@@ -65,7 +75,8 @@ def capture_main_screen():
         screenshot = ImageGrab.grab()
     return np.array(screenshot)
 
-def detect_boss(screen_img, template_img):
+
+def detect_boss(screen_img, template_img, template_mask):
     screen_gray = cv2.cvtColor(screen_img, cv2.COLOR_BGR2GRAY)
     template_gray = cv2.cvtColor(template_img, cv2.COLOR_BGR2GRAY)
 
@@ -75,14 +86,18 @@ def detect_boss(screen_img, template_img):
     best_size = None
 
     scales = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0, 1.2]
-    
+
     for scale in scales:
-        scaled = cv2.resize(template_gray, None, fx=scale, fy=scale)
-        sh, sw = scaled.shape
+        scaled_tmpl = cv2.resize(template_gray, None, fx=scale, fy=scale)
+        scaled_mask = cv2.resize(template_mask, None, fx=scale, fy=scale)
+        # 重新二值化mask（缩放后可能有中间值）
+        _, scaled_mask = cv2.threshold(scaled_mask, 127, 255, cv2.THRESH_BINARY)
+        sh, sw = scaled_tmpl.shape
         if sh > screen_gray.shape[0] or sw > screen_gray.shape[1]:
             continue
 
-        result = cv2.matchTemplate(screen_gray, scaled, cv2.TM_CCOEFF_NORMED)
+        # 使用TM_CCORR_NORMED + mask，白色区域不参与匹配
+        result = cv2.matchTemplate(screen_gray, scaled_tmpl, cv2.TM_CCORR_NORMED, mask=scaled_mask)
         _, max_val, _, max_loc = cv2.minMaxLoc(result)
 
         if max_val > best_match:
@@ -101,6 +116,7 @@ def detect_boss(screen_img, template_img):
 
     return found, best_match, screen_img
 
+
 def send_alert(msg, count):
     full_msg = f"{msg}\n\n已累计检测到 {count} 次"
     ctypes.windll.user32.MessageBoxW(0, full_msg, "🦉 Boss刷新提醒！", 0x00000040 | 0x00001000)
@@ -108,53 +124,53 @@ def send_alert(msg, count):
 
 class MonitorWindow:
     """小型监控窗口，显示实时预览和状态"""
-    
+
     def __init__(self, master, template_path):
         self.master = master
         self.template_path = template_path
         self.detected_count = 0
         self.last_status = "等待中..."
         self.last_confidence = 0
-        self._photo = None  # 保持引用防止GC
+        self._photo = None
         self._alert_cooldown = False
-        
+
         master.title("🦉 冒险岛Boss监控")
         master.resizable(False, False)
         master.protocol("WM_DELETE_WINDOW", self.on_close)
-        
+
         # 加载模板缩略图
         try:
             tmpl = Image.open(template_path).resize((60, 60))
             self._tmpl_photo = ImageTk.PhotoImage(tmpl)
         except:
             self._tmpl_photo = None
-        
+
         # 预览尺寸
         self.preview_w = int(1920 * PREVIEW_SCALE)
         self.preview_h = int(1080 * PREVIEW_SCALE)
-        
+
         # --- 布局 ---
         main_frame = ttk.Frame(master, padding=6)
         main_frame.pack()
-        
-        # 标题行：模板 + 标题
+
+        # 标题行
         top = ttk.Frame(main_frame)
         top.pack(fill=tk.X, pady=(0, 4))
-        
+
         if self._tmpl_photo:
             ttk.Label(top, image=self._tmpl_photo).pack(side=tk.LEFT, padx=(0, 6))
-        
+
         ttk.Label(top, text="Boss监控运行中", font=("微软雅黑", 10, "bold")).pack(side=tk.LEFT)
-        
+
         # 预览图
         self.preview_label = ttk.Label(main_frame)
         self.preview_label.pack(pady=2)
-        
+
         # 状态信息
         self.status_var = tk.StringVar(value="初始化...")
         ttk.Label(main_frame, textvariable=self.status_var, font=("Consolas", 9)).pack(anchor=tk.W, pady=1)
-        
-        # 进度条（匹配度）
+
+        # 匹配度进度条
         pb_frame = ttk.Frame(main_frame)
         pb_frame.pack(fill=tk.X, pady=2)
         ttk.Label(pb_frame, text="匹配度:", font=("微软雅黑", 8)).pack(side=tk.LEFT)
@@ -162,70 +178,61 @@ class MonitorWindow:
         self.progress.pack(side=tk.LEFT, padx=4)
         self.conf_label = tk.StringVar(value="0.0%")
         ttk.Label(pb_frame, textvariable=self.conf_label, font=("Consolas", 8), width=6).pack(side=tk.LEFT)
-        
-        # 阈值线指示
+
+        # 底部信息
         ttk.Label(main_frame, text=f"阈值: {MATCH_THRESHOLD:.0%} | 间隔: {CHECK_INTERVAL}s | 主屏幕: {MONITOR_ONLY_MAIN}",
                   font=("微软雅黑", 7), foreground="gray").pack(anchor=tk.W)
-    
+
     def update_preview(self, img_array, found, confidence):
-        """更新预览图和状态（在tkinter主线程中调用）"""
-        # 缩小预览
+        """更新预览图和状态"""
         small = cv2.resize(img_array, (self.preview_w, self.preview_h))
-        # BGR -> RGB
         rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(rgb)
         self._photo = ImageTk.PhotoImage(pil_img)
         self.preview_label.config(image=self._photo)
-        
-        # 更新状态
+
         now = time.strftime("%H:%M:%S")
         if found:
             self.detected_count += 1
-            self.last_status = f"🚨 [{now}] BOSS出现! (第{self.detected_count}次)"
-            self.status_var.set(self.last_status)
+            self.status_var.set(f"🚨 [{now}] BOSS出现! (第{self.detected_count}次)")
         else:
-            self.last_status = f"  [{now}] 未检测到"
-            self.status_var.set(self.last_status)
-        
-        self.last_confidence = confidence
+            self.status_var.set(f"  [{now}] 未检测到")
+
         pct = min(confidence * 100, 100)
         self.progress['value'] = pct
         self.conf_label.set(f"{pct:.1f}%")
-    
+
     def on_close(self):
         global running
         running = False
         self.master.destroy()
 
 
-def monitor_loop(window, template):
-    """监控主循环（在子线程运行）"""
+def monitor_loop(window, template, template_mask):
+    """监控主循环（子线程）"""
     global running
-    
+
     while running:
         try:
             screen = capture_main_screen()
-            found, confidence, marked = detect_boss(screen, template)
-            
-            # 在tkinter线程中更新UI
+            found, confidence, marked = detect_boss(screen, template, template_mask)
+
             window.master.after(0, window.update_preview, marked, found, confidence)
-            
-            # 弹窗提醒（带冷却）
+
             if found and not window._alert_cooldown:
                 window.master.after(0, send_alert, "🦉 BOSS出现了！快去打！", window.detected_count)
                 ts = int(time.time())
                 cv2.imwrite(f"boss_detected_{ts}.png", marked)
                 window._alert_cooldown = True
-                # 冷却期间在子线程等60秒
                 cooldown_end = time.time() + 60
                 while running and time.time() < cooldown_end:
                     time.sleep(1)
                 window._alert_cooldown = False
             elif not found:
                 window._alert_cooldown = False
-            
-            time.sleep(max(CHECK_INTERVAL, 1))
-            
+
+            time.sleep(max(CHECK_INTERVAL, 0.5))
+
         except Exception as e:
             print(f"检测出错: {e}")
             time.sleep(CHECK_INTERVAL)
@@ -246,19 +253,22 @@ def main():
         ctypes.windll.user32.MessageBoxW(0, msg, "配置错误", 0x00000010)
         sys.exit(1)
 
+    # 创建mask（忽略白色背景）
+    template_mask = create_template_mask(template)
+
     # 启动tkinter窗口
     root = tk.Tk()
     window = MonitorWindow(root, template_path)
-    
+
     print(f"🦉 冒险岛Boss监控已启动")
     print(f"   模板: {template_path} ({template.shape[1]}x{template.shape[0]})")
     print(f"   间隔: {CHECK_INTERVAL}s | 阈值: {MATCH_THRESHOLD} | 主屏: {MONITOR_ONLY_MAIN}")
-    
+    print(f"   Mask: 已启用（忽略白色背景）")
+
     # 启动监控线程
-    t = threading.Thread(target=monitor_loop, args=(window, template), daemon=True)
+    t = threading.Thread(target=monitor_loop, args=(window, template, template_mask), daemon=True)
     t.start()
-    
-    # tkinter主循环
+
     root.mainloop()
     print("监控已停止。")
 
