@@ -2,7 +2,7 @@
 冒险岛Boss监控脚本
 - 截取主屏幕
 - 用模板匹配检测Boss出现
-- 检测到弹窗提醒
+- 弹窗提醒 + 小型监控窗口显示实时状态
 
 依赖安装:
     pip install opencv-python numpy Pillow
@@ -10,14 +10,16 @@
 使用方法:
     1. 把boss截图保存为 boss_template.png，和本脚本放同一目录
     2. 运行: python maple_boss_monitor.py
-    3. Ctrl+C 停止
+    3. Ctrl+C 或关闭监控窗口停止
 """
 
 import time
 import os
 import sys
 import ctypes
+import threading
 import numpy as np
+from datetime import datetime
 
 try:
     import cv2
@@ -26,9 +28,16 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from PIL import ImageGrab
+    from PIL import ImageGrab, Image
 except ImportError:
     print("需要安装Pillow，运行: pip install Pillow")
+    sys.exit(1)
+
+try:
+    import tkinter as tk
+    from tkinter import ttk
+except ImportError:
+    print("需要tkinter（Python自带，如果缺失请重新安装Python）")
     sys.exit(1)
 
 # ============ 配置（可按需修改） ============
@@ -36,30 +45,26 @@ BOSS_IMAGE_PATH = "boss_template.png"  # boss截图文件名，和脚本同目�
 CHECK_INTERVAL = 3        # 检测间隔（秒），建议3-5秒
 MATCH_THRESHOLD = 0.7    # 匹配阈值（0-1），越高越严格不容易误报，越低越灵敏
 MONITOR_ONLY_MAIN = True  # True=只监控主屏幕（双屏适用）
+PREVIEW_SCALE = 0.25     # 监控窗口预览缩放比例（越小窗口越小）
 # ===========================================
 
+running = True
+
 def get_primary_screen_bounds():
-    """获取主屏幕区域（Windows双屏时只取主屏）"""
     user32 = ctypes.windll.user32
-    
-    # 获取主屏幕分辨率
-    w = user32.GetSystemMetrics(0)   # SM_CXSCREEN
-    h = user32.GetSystemMetrics(1)   # SM_CYSCREEN
-    
+    w = user32.GetSystemMetrics(0)
+    h = user32.GetSystemMetrics(1)
     return (0, 0, w, h)
 
 def capture_main_screen():
-    """截取主屏幕"""
     if MONITOR_ONLY_MAIN:
         bounds = get_primary_screen_bounds()
-        print(f"  截屏区域: 主屏幕 {bounds[2]}x{bounds[3]}")
         screenshot = ImageGrab.grab(bbox=bounds)
     else:
         screenshot = ImageGrab.grab()
     return np.array(screenshot)
 
 def detect_boss(screen_img, template_img):
-    """多尺度模板匹配检测boss"""
     screen_gray = cv2.cvtColor(screen_img, cv2.COLOR_BGR2GRAY)
     template_gray = cv2.cvtColor(template_img, cv2.COLOR_BGR2GRAY)
 
@@ -68,7 +73,6 @@ def detect_boss(screen_img, template_img):
     best_loc = None
     best_size = None
 
-    # 多缩放比例匹配，适应不同分辨率
     scales = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0, 1.2]
     
     for scale in scales:
@@ -97,13 +101,136 @@ def detect_boss(screen_img, template_img):
     return found, best_match, screen_img
 
 def send_alert(msg, count):
-    """Windows弹窗提醒"""
     full_msg = f"{msg}\n\n已累计检测到 {count} 次"
-    # MB_ICONINFORMATION + MB_SYSTEMMODAL（置顶弹窗）
     ctypes.windll.user32.MessageBoxW(0, full_msg, "🦉 Boss刷新提醒！", 0x00000040 | 0x00001000)
 
+
+class MonitorWindow:
+    """小型监控窗口，显示实时预览和状态"""
+    
+    def __init__(self, master, template_path):
+        self.master = master
+        self.template_path = template_path
+        self.detected_count = 0
+        self.last_status = "等待中..."
+        self.last_confidence = 0
+        self._photo = None  # 保持引用防止GC
+        self._alert_cooldown = False
+        
+        master.title("🦉 冒险岛Boss监控")
+        master.resizable(False, False)
+        master.protocol("WM_DELETE_WINDOW", self.on_close)
+        
+        # 加载模板缩略图
+        try:
+            tmpl = Image.open(template_path).resize((60, 60))
+            self._tmpl_photo = tk.PhotoImage(tmpl)
+        except:
+            self._tmpl_photo = None
+        
+        # 预览尺寸
+        self.preview_w = int(1920 * PREVIEW_SCALE)
+        self.preview_h = int(1080 * PREVIEW_SCALE)
+        
+        # --- 布局 ---
+        main_frame = ttk.Frame(master, padding=6)
+        main_frame.pack()
+        
+        # 标题行：模板 + 标题
+        top = ttk.Frame(main_frame)
+        top.pack(fill=tk.X, pady=(0, 4))
+        
+        if self._tmpl_photo:
+            ttk.Label(top, image=self._tmpl_photo).pack(side=tk.LEFT, padx=(0, 6))
+        
+        ttk.Label(top, text="Boss监控运行中", font=("微软雅黑", 10, "bold")).pack(side=tk.LEFT)
+        
+        # 预览图
+        self.preview_label = ttk.Label(main_frame)
+        self.preview_label.pack(pady=2)
+        
+        # 状态信息
+        self.status_var = tk.StringVar(value="初始化...")
+        ttk.Label(main_frame, textvariable=self.status_var, font=("Consolas", 9)).pack(anchor=tk.W, pady=1)
+        
+        # 进度条（匹配度）
+        pb_frame = ttk.Frame(main_frame)
+        pb_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(pb_frame, text="匹配度:", font=("微软雅黑", 8)).pack(side=tk.LEFT)
+        self.progress = ttk.Progressbar(pb_frame, length=150, maximum=100, mode='determinate')
+        self.progress.pack(side=tk.LEFT, padx=4)
+        self.conf_label = tk.StringVar(value="0.0%")
+        ttk.Label(pb_frame, textvariable=self.conf_label, font=("Consolas", 8), width=6).pack(side=tk.LEFT)
+        
+        # 阈值线指示
+        ttk.Label(main_frame, text=f"阈值: {MATCH_THRESHOLD:.0%} | 间隔: {CHECK_INTERVAL}s | 主屏幕: {MONITOR_ONLY_MAIN}",
+                  font=("微软雅黑", 7), foreground="gray").pack(anchor=tk.W)
+    
+    def update_preview(self, img_array, found, confidence):
+        """更新预览图和状态（在tkinter主线程中调用）"""
+        # 缩小预览
+        small = cv2.resize(img_array, (self.preview_w, self.preview_h))
+        # BGR -> RGB
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb)
+        self._photo = tk.PhotoImage(pil_img)
+        self.preview_label.config(image=self._photo)
+        
+        # 更新状态
+        now = time.strftime("%H:%M:%S")
+        if found:
+            self.detected_count += 1
+            self.last_status = f"🚨 [{now}] BOSS出现! (第{self.detected_count}次)"
+            self.status_var.set(self.last_status)
+        else:
+            self.last_status = f"  [{now}] 未检测到"
+            self.status_var.set(self.last_status)
+        
+        self.last_confidence = confidence
+        pct = min(confidence * 100, 100)
+        self.progress['value'] = pct
+        self.conf_label.set(f"{pct:.1f}%")
+    
+    def on_close(self):
+        global running
+        running = False
+        self.master.destroy()
+
+
+def monitor_loop(window, template):
+    """监控主循环（在子线程运行）"""
+    global running
+    
+    while running:
+        try:
+            screen = capture_main_screen()
+            found, confidence, marked = detect_boss(screen, template)
+            
+            # 在tkinter线程中更新UI
+            window.master.after(0, window.update_preview, marked, found, confidence)
+            
+            # 弹窗提醒（带冷却）
+            if found and not window._alert_cooldown:
+                window.master.after(0, send_alert, "🦉 BOSS出现了！快去打！", window.detected_count)
+                ts = int(time.time())
+                cv2.imwrite(f"boss_detected_{ts}.png", marked)
+                window._alert_cooldown = True
+                # 冷却期间在子线程等60秒
+                cooldown_end = time.time() + 60
+                while running and time.time() < cooldown_end:
+                    time.sleep(1)
+                window._alert_cooldown = False
+            elif not found:
+                window._alert_cooldown = False
+            
+            time.sleep(max(CHECK_INTERVAL, 1))
+            
+        except Exception as e:
+            print(f"检测出错: {e}")
+            time.sleep(CHECK_INTERVAL)
+
+
 def main():
-    # 检查模板图片
     script_dir = os.path.dirname(os.path.abspath(__file__))
     template_path = os.path.join(script_dir, BOSS_IMAGE_PATH)
 
@@ -118,48 +245,22 @@ def main():
         ctypes.windll.user32.MessageBoxW(0, msg, "配置错误", 0x00000010)
         sys.exit(1)
 
-    print("=" * 50)
-    print("🦉 冒险岛Boss监控已启动")
-    print(f"   模板图片: {template_path}")
-    print(f"   模板尺寸: {template.shape[1]}x{template.shape[0]}")
-    print(f"   检测间隔: {CHECK_INTERVAL}秒")
-    print(f"   匹配阈值: {MATCH_THRESHOLD}")
-    print(f"   监控范围: {'主屏幕' if MONITOR_ONLY_MAIN else '全部屏幕'}")
-    print("   按 Ctrl+C 停止")
-    print("=" * 50)
+    # 启动tkinter窗口
+    root = tk.Tk()
+    window = MonitorWindow(root, template_path)
+    
+    print(f"🦉 冒险岛Boss监控已启动")
+    print(f"   模板: {template_path} ({template.shape[1]}x{template.shape[0]})")
+    print(f"   间隔: {CHECK_INTERVAL}s | 阈值: {MATCH_THRESHOLD} | 主屏: {MONITOR_ONLY_MAIN}")
+    
+    # 启动监控线程
+    t = threading.Thread(target=monitor_loop, args=(window, template), daemon=True)
+    t.start()
+    
+    # tkinter主循环
+    root.mainloop()
+    print("监控已停止。")
 
-    detected_count = 0
-    alert_cooldown = False
-
-    try:
-        while True:
-            now = time.strftime("%H:%M:%S")
-            print(f"\n[{now}] 检测中...")
-
-            screen = capture_main_screen()
-            found, confidence, marked = detect_boss(screen, template)
-
-            print(f"  最佳匹配度: {confidence:.3f} (阈值: {MATCH_THRESHOLD})")
-
-            if found and not alert_cooldown:
-                detected_count += 1
-                send_alert("🦉 BOSS出现了！快去打！", detected_count)
-                # 保存检测截图
-                ts = int(time.time())
-                cv2.imwrite(f"boss_detected_{ts}.png", marked)
-                print(f"  🚨 已提醒！截图已保存: boss_detected_{ts}.png")
-                # 60秒内不重复弹窗，避免疯狂弹
-                alert_cooldown = True
-                print("  冷却60秒，避免重复弹窗...")
-            elif found and alert_cooldown:
-                print("  🦉 Boss仍在，冷却中不重复提醒")
-            else:
-                alert_cooldown = False
-
-            time.sleep(CHECK_INTERVAL)
-
-    except KeyboardInterrupt:
-        print(f"\n监控已停止。共检测到boss {detected_count} 次。")
 
 if __name__ == "__main__":
     main()
