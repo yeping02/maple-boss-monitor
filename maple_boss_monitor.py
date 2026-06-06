@@ -54,12 +54,15 @@ WINDOW_Y = 980            # 窗口Y坐标（距顶部，1440屏的话靠近底�
 running = True
 
 
-def create_template_mask(template_img):
-    """创建mask，把白色/近白色背景区域标记为忽略"""
-    gray = cv2.cvtColor(template_img, cv2.COLOR_BGR2GRAY)
-    # 白色像素(>230)标记为0（忽略），其他标记为255（参与匹配）
-    mask = np.where(gray > 230, 0, 255).astype(np.uint8)
-    return mask
+def prepare_template(template_img):
+    """处理模板：把白色/近白色背景填充成随机噪声，避免误匹配"""
+    img = template_img.copy()
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    white_mask = gray > 230
+    # 用随机噪点填充白色区域（不可能跟游戏画面匹配）
+    noise = np.random.randint(0, 256, img.shape, dtype=np.uint8)
+    img[white_mask] = noise[white_mask]
+    return img
 
 
 def get_primary_screen_bounds():
@@ -78,7 +81,7 @@ def capture_main_screen():
     return np.array(screenshot)
 
 
-def detect_boss(screen_img, template_img, template_mask):
+def detect_boss(screen_img, template_img):
     screen_gray = cv2.cvtColor(screen_img, cv2.COLOR_BGR2GRAY)
     template_gray = cv2.cvtColor(template_img, cv2.COLOR_BGR2GRAY)
 
@@ -91,15 +94,12 @@ def detect_boss(screen_img, template_img, template_mask):
 
     for scale in scales:
         scaled_tmpl = cv2.resize(template_gray, None, fx=scale, fy=scale)
-        scaled_mask = cv2.resize(template_mask, None, fx=scale, fy=scale)
-        # 重新二值化mask（缩放后可能有中间值）
-        _, scaled_mask = cv2.threshold(scaled_mask, 127, 255, cv2.THRESH_BINARY)
         sh, sw = scaled_tmpl.shape
         if sh > screen_gray.shape[0] or sw > screen_gray.shape[1]:
             continue
 
-        # 使用TM_CCORR_NORMED + mask，白色区域不参与匹配
-        result = cv2.matchTemplate(screen_gray, scaled_tmpl, cv2.TM_CCORR_NORMED, mask=scaled_mask)
+        # 使用TM_CCOEFF_NORMED，随机噪点区域不会产生有意义的相关性
+        result = cv2.matchTemplate(screen_gray, scaled_tmpl, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv2.minMaxLoc(result)
 
         if max_val > best_match:
@@ -211,14 +211,14 @@ class MonitorWindow:
         self.master.destroy()
 
 
-def monitor_loop(window, template, template_mask):
+def monitor_loop(window, template):
     """监控主循环（子线程）"""
     global running
 
     while running:
         try:
             screen = capture_main_screen()
-            found, confidence, marked = detect_boss(screen, template, template_mask)
+            found, confidence, marked = detect_boss(screen, template)
 
             window.master.after(0, window.update_preview, marked, found, confidence)
 
@@ -256,8 +256,8 @@ def main():
         ctypes.windll.user32.MessageBoxW(0, msg, "配置错误", 0x00000010)
         sys.exit(1)
 
-    # 创建mask（忽略白色背景）
-    template_mask = create_template_mask(template)
+    # 处理模板（白色背景填充噪点，避免误匹配）
+    template = prepare_template(template)
 
     # 启动tkinter窗口
     root = tk.Tk()
@@ -266,10 +266,10 @@ def main():
     print(f"🦉 冒险岛Boss监控已启动")
     print(f"   模板: {template_path} ({template.shape[1]}x{template.shape[0]})")
     print(f"   间隔: {CHECK_INTERVAL}s | 阈值: {MATCH_THRESHOLD} | 主屏: {MONITOR_ONLY_MAIN}")
-    print(f"   Mask: 已启用（忽略白色背景）")
+    print(f"   Mask: 噪点填充白色背景")
 
     # 启动监控线程
-    t = threading.Thread(target=monitor_loop, args=(window, template, template_mask), daemon=True)
+    t = threading.Thread(target=monitor_loop, args=(window, template), daemon=True)
     t.start()
 
     root.mainloop()
