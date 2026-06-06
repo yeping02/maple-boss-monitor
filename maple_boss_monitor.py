@@ -1,7 +1,7 @@
 """
 冒险岛Boss监控脚本
 - 截取主屏幕
-- 用模板匹配检测Boss出现（mask忽略白色背景）
+- ORB特征点匹配检测Boss出现（不受背景/缩放影响）
 - 弹窗提醒 + 小型监控窗口显示实时状态
 
 依赖安装:
@@ -44,25 +44,20 @@ except ImportError:
 # ============ 配置（可按需修改） ============
 BOSS_IMAGE_PATH = "boss_template.png"  # boss截图文件名，和脚本同目录
 CHECK_INTERVAL = 0.1      # 检测间隔（秒）
-MATCH_THRESHOLD = 0.7    # 匹配阈值（0-1），越高越严格不容易误报，越低越灵敏
-MONITOR_ONLY_MAIN = True  # True=只监控主屏幕（双屏适用）
-PREVIEW_SCALE = 0.25     # 监控窗口预览缩放比例（越小窗口越小）
+MATCH_THRESHOLD = 0.6      # 匹配阈值（0-1），ORB匹配得分比例
+MIN_MATCH_COUNT = 15       # 最少需要多少个特征点匹配才算boss
+MONITOR_ONLY_MAIN = True   # True=只监控主屏幕（双屏适用）
+PREVIEW_SCALE = 0.25       # 监控窗口预览缩放比例
 WINDOW_X = -520            # 窗口X坐标（负数=主屏左侧，即副屏）
-WINDOW_Y = 980            # 窗口Y坐标（距顶部，1440屏的话靠近底部）
+WINDOW_Y = 980             # 窗口Y坐标（距顶部）
 # ===========================================
 
 running = True
 
-
-def prepare_template(template_img):
-    """处理模板：把白色/近白色背景填充成随机噪声，避免误匹配"""
-    img = template_img.copy()
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    white_mask = gray > 230
-    # 用随机噪点填充白色区域（不可能跟游戏画面匹配）
-    noise = np.random.randint(0, 256, img.shape, dtype=np.uint8)
-    img[white_mask] = noise[white_mask]
-    return img
+# 全局ORB检测器
+orb = cv2.ORB_create(nfeatures=1000)
+# BFMatcher with Hamming距离（ORB用的是二进制描述子）
+bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
 
 
 def get_primary_screen_bounds():
@@ -81,42 +76,67 @@ def capture_main_screen():
     return np.array(screenshot)
 
 
-def detect_boss(screen_img, template_img):
-    screen_gray = cv2.cvtColor(screen_img, cv2.COLOR_BGR2GRAY)
-    template_gray = cv2.cvtColor(template_img, cv2.COLOR_BGR2GRAY)
+def extract_orb_features(img_bgr):
+    """从图像中提取ORB特征点和描述子，去除白色背景区域的特征"""
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    # 创建mask：白色区域忽略
+    mask = np.ones_like(gray, dtype=np.uint8) * 255
+    white = gray > 220
+    mask[white] = 0
+    # 检测特征点
+    kp, des = orb.detectAndCompute(gray, mask)
+    return kp, des
 
-    best_match = 0
-    found = False
-    best_loc = None
-    best_size = None
 
-    scales = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0, 1.2]
+def detect_boss(screen_img, template_kp, template_des):
+    """用ORB特征点匹配检测boss"""
+    # 下采样加速检测
+    h, w = screen_img.shape[:2]
+    if h > 720:
+        scale = 720 / h
+        small = cv2.resize(screen_img, None, fx=scale, fy=scale)
+    else:
+        small = screen_img
+        scale = 1.0
 
-    for scale in scales:
-        scaled_tmpl = cv2.resize(template_gray, None, fx=scale, fy=scale)
-        sh, sw = scaled_tmpl.shape
-        if sh > screen_gray.shape[0] or sw > screen_gray.shape[1]:
-            continue
+    screen_gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    screen_kp, screen_des = orb.detectAndCompute(screen_gray, None)
 
-        # 使用TM_CCOEFF_NORMED，随机噪点区域不会产生有意义的相关性
-        result = cv2.matchTemplate(screen_gray, scaled_tmpl, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+    if screen_des is None or template_des is None:
+        return False, 0.0, 0, screen_img
 
-        if max_val > best_match:
-            best_match = max_val
-            best_loc = max_loc
-            best_size = (sw, sh)
+    # KNN匹配，ratio test过滤
+    matches = bf.knnMatch(template_des, screen_des, k=2)
+    good = []
+    for match_pair in matches:
+        if len(match_pair) == 2:
+            m, n = match_pair
+            if m.distance < 0.75 * n.distance:
+                good.append(m)
 
-        if max_val >= MATCH_THRESHOLD:
-            found = True
-            break
+    match_count = len(good)
+    # 匹配得分 = 匹配数 / 模板特征数
+    score = match_count / max(len(template_kp), 1)
 
-    if found:
-        top_left = best_loc
-        bottom_right = (top_left[0] + best_size[0], top_left[1] + best_size[1])
-        cv2.rectangle(screen_img, top_left, bottom_right, (0, 255, 0), 3)
+    found = match_count >= MIN_MATCH_COUNT
 
-    return found, best_match, screen_img
+    # 在截图上画出匹配点
+    marked = screen_img.copy()
+    if match_count > 0 and scale < 1.0:
+        # 如果下采样了，把匹配点坐标映射回原图
+        pts = [(int(m.queryIdx), int(m.trainIdx)) for m in good[:50]]
+        # 画出一些匹配点作为标记
+        display = cv2.resize(small, (w, h))
+        for m in good[:50]:
+            sx, sy = screen_kp[m.trainIdx].pt
+            cv2.circle(display, (int(sx / scale), int(sy / scale)), 3, (0, 255, 0), -1)
+        marked = display
+    elif match_count > 0:
+        for m in good[:50]:
+            sx, sy = screen_kp[m.trainIdx].pt
+            cv2.circle(marked, (int(sx / scale), int(sy / scale)), 3, (0, 255, 0), -1)
+
+    return found, score, match_count, marked
 
 
 def send_alert(msg, count):
@@ -131,8 +151,6 @@ class MonitorWindow:
         self.master = master
         self.template_path = template_path
         self.detected_count = 0
-        self.last_status = "等待中..."
-        self.last_confidence = 0
         self._photo = None
         self._alert_cooldown = False
 
@@ -156,7 +174,6 @@ class MonitorWindow:
         main_frame = ttk.Frame(master, padding=6)
         main_frame.pack()
 
-        # 标题行
         top = ttk.Frame(main_frame)
         top.pack(fill=tk.X, pady=(0, 4))
 
@@ -182,11 +199,14 @@ class MonitorWindow:
         self.conf_label = tk.StringVar(value="0.0%")
         ttk.Label(pb_frame, textvariable=self.conf_label, font=("Consolas", 8), width=6).pack(side=tk.LEFT)
 
-        # 底部信息
-        ttk.Label(main_frame, text=f"阈值: {MATCH_THRESHOLD:.0%} | 间隔: {CHECK_INTERVAL}s | 主屏幕: {MONITOR_ONLY_MAIN}",
+        # 特征点数
+        self.match_var = tk.StringVar(value="特征点: 0")
+        ttk.Label(main_frame, textvariable=self.match_var, font=("微软雅黑", 8), foreground="gray").pack(anchor=tk.W)
+
+        ttk.Label(main_frame, text=f"阈值: {MATCH_THRESHOLD:.0%} | 最少{MIN_MATCH_COUNT}点 | 间隔: {CHECK_INTERVAL}s",
                   font=("微软雅黑", 7), foreground="gray").pack(anchor=tk.W)
 
-    def update_preview(self, img_array, found, confidence):
+    def update_preview(self, img_array, found, score, match_count):
         """更新预览图和状态"""
         small = cv2.resize(img_array, (self.preview_w, self.preview_h))
         rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
@@ -201,9 +221,10 @@ class MonitorWindow:
         else:
             self.status_var.set(f"  [{now}] 未检测到")
 
-        pct = min(confidence * 100, 100)
+        pct = min(score * 100, 100)
         self.progress['value'] = pct
         self.conf_label.set(f"{pct:.1f}%")
+        self.match_var.set(f"特征点匹配: {match_count}/{MIN_MATCH_COUNT}")
 
     def on_close(self):
         global running
@@ -211,16 +232,16 @@ class MonitorWindow:
         self.master.destroy()
 
 
-def monitor_loop(window, template):
+def monitor_loop(window, template_kp, template_des):
     """监控主循环（子线程）"""
     global running
 
     while running:
         try:
             screen = capture_main_screen()
-            found, confidence, marked = detect_boss(screen, template)
+            found, score, match_count, marked = detect_boss(screen, template_kp, template_des)
 
-            window.master.after(0, window.update_preview, marked, found, confidence)
+            window.master.after(0, window.update_preview, marked, found, score, match_count)
 
             if found and not window._alert_cooldown:
                 window.master.after(0, send_alert, "🦉 BOSS出现了！快去打！", window.detected_count)
@@ -234,11 +255,9 @@ def monitor_loop(window, template):
             elif not found:
                 window._alert_cooldown = False
 
-            time.sleep(max(CHECK_INTERVAL, 0.5))
-
         except Exception as e:
             print(f"检测出错: {e}")
-            time.sleep(CHECK_INTERVAL)
+        time.sleep(max(CHECK_INTERVAL, 0.05))
 
 
 def main():
@@ -256,20 +275,22 @@ def main():
         ctypes.windll.user32.MessageBoxW(0, msg, "配置错误", 0x00000010)
         sys.exit(1)
 
-    # 处理模板（白色背景填充噪点，避免误匹配）
-    template = prepare_template(template)
+    # 提取模板ORB特征（忽略白色背景）
+    template_kp, template_des = extract_orb_features(template)
+    print(f"🦉 冒险岛Boss监控已启动")
+    print(f"   模板: {template_path} ({template.shape[1]}x{template.shape[0]})")
+    print(f"   特征点数: {len(template_kp)}")
+    print(f"   间隔: {CHECK_INTERVAL}s | 最少匹配: {MIN_MATCH_COUNT}点")
 
-    # 启动tkinter窗口
+    if len(template_kp) < MIN_MATCH_COUNT:
+        msg = f"模板特征点太少({len(template_kp)}点)，请换一张更清晰的boss截图"
+        ctypes.windll.user32.MessageBoxW(0, msg, "配置警告", 0x00000030)
+        print(f"   ⚠️ 警告: 特征点太少")
+
     root = tk.Tk()
     window = MonitorWindow(root, template_path)
 
-    print(f"🦉 冒险岛Boss监控已启动")
-    print(f"   模板: {template_path} ({template.shape[1]}x{template.shape[0]})")
-    print(f"   间隔: {CHECK_INTERVAL}s | 阈值: {MATCH_THRESHOLD} | 主屏: {MONITOR_ONLY_MAIN}")
-    print(f"   Mask: 噪点填充白色背景")
-
-    # 启动监控线程
-    t = threading.Thread(target=monitor_loop, args=(window, template), daemon=True)
+    t = threading.Thread(target=monitor_loop, args=(window, template_kp, template_des), daemon=True)
     t.start()
 
     root.mainloop()
