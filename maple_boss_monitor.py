@@ -29,10 +29,7 @@ except ImportError:
 
 try:
     from PIL import ImageGrab, Image
-try:
     from PIL import ImageTk
-except ImportError:
-    ImageTk = None
 except ImportError:
     print("需要安装Pillow，运行: pip install Pillow")
     sys.exit(1)
