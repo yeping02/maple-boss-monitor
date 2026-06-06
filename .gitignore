@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Boss截图
+boss_template.png
+
+# 检测结果截图
+boss_detected_*.png
+
+# IDE
+.vscode/
+.idea/
