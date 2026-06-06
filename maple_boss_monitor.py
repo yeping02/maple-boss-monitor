@@ -43,7 +43,7 @@ except ImportError:
 
 # ============ 配置（可按需修改） ============
 BOSS_IMAGE_PATH = "boss_template.png"  # boss截图文件名，和脚本同目录
-CHECK_INTERVAL = 0.3      # 检测间隔（秒）
+CHECK_INTERVAL = 0.1      # 检测间隔（秒）
 MATCH_THRESHOLD = 0.7    # 匹配阈值（0-1），越高越严格不容易误报，越低越灵敏
 MONITOR_ONLY_MAIN = True  # True=只监控主屏幕（双屏适用）
 PREVIEW_SCALE = 0.25     # 监控窗口预览缩放比例（越小窗口越小）
