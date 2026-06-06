@@ -47,6 +47,8 @@ CHECK_INTERVAL = 1        # 检测间隔（秒）
 MATCH_THRESHOLD = 0.7    # 匹配阈值（0-1），越高越严格不容易误报，越低越灵敏
 MONITOR_ONLY_MAIN = True  # True=只监控主屏幕（双屏适用）
 PREVIEW_SCALE = 0.25     # 监控窗口预览缩放比例（越小窗口越小）
+WINDOW_X = -520            # 窗口X坐标（负数=主屏左侧，即副屏）
+WINDOW_Y = 50             # 窗口Y坐标（距顶部）
 # ===========================================
 
 running = True
@@ -136,6 +138,7 @@ class MonitorWindow:
 
         master.title("🦉 冒险岛Boss监控")
         master.resizable(False, False)
+        master.geometry(f"+{WINDOW_X}+{WINDOW_Y}")
         master.protocol("WM_DELETE_WINDOW", self.on_close)
 
         # 加载模板缩略图
