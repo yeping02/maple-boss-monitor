@@ -29,6 +29,10 @@ except ImportError:
 
 try:
     from PIL import ImageGrab, Image
+try:
+    from PIL import ImageTk
+except ImportError:
+    ImageTk = None
 except ImportError:
     print("需要安装Pillow，运行: pip install Pillow")
     sys.exit(1)
@@ -124,7 +128,7 @@ class MonitorWindow:
         # 加载模板缩略图
         try:
             tmpl = Image.open(template_path).resize((60, 60))
-            self._tmpl_photo = tk.PhotoImage(tmpl)
+            self._tmpl_photo = ImageTk.PhotoImage(tmpl)
         except:
             self._tmpl_photo = None
         
