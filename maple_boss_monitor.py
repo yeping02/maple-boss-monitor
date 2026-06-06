@@ -48,7 +48,7 @@ MATCH_THRESHOLD = 0.7    # 匹配阈值（0-1），越高越严格不容易误�
 MONITOR_ONLY_MAIN = True  # True=只监控主屏幕（双屏适用）
 PREVIEW_SCALE = 0.25     # 监控窗口预览缩放比例（越小窗口越小）
 WINDOW_X = -520            # 窗口X坐标（负数=主屏左侧，即副屏）
-WINDOW_Y = 50             # 窗口Y坐标（距顶部）
+WINDOW_Y = 980            # 窗口Y坐标（距顶部，1440屏的话靠近底部）
 # ===========================================
 
 running = True
