@@ -174,7 +174,7 @@ class MonitorWindow:
         # BGR -> RGB
         rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(rgb)
-        self._photo = tk.PhotoImage(pil_img)
+        self._photo = ImageTk.PhotoImage(pil_img)
         self.preview_label.config(image=self._photo)
         
         # 更新状态
